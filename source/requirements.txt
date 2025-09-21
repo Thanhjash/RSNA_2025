@@ -1,0 +1,42 @@
+# Phase 0 Pre-training Requirements for RSNA 2025
+
+# Core ML/DL frameworks
+torch>=1.12.0
+torchvision>=0.13.0
+numpy>=1.21.0
+
+# Medical imaging
+SimpleITK>=2.1.0
+nibabel>=3.2.0
+
+# Data processing
+pandas>=1.3.0
+scipy>=1.7.0
+
+# Wavelet transform library
+PyWavelets>=1.3.0
+# Note: ptwt (PyTorch Wavelet Toolbox) may need to be installed separately
+# pip install git+https://github.com/v0lta/PyTorch-Wavelet-Toolbox.git
+
+# Sparse convolutions
+# Note: MinkowskiEngine needs to be installed separately based on CUDA version
+# See: https://github.com/NVIDIA/MinkowskiEngine
+
+# Data augmentation
+# monai>=0.9.0  # Uncomment if using MONAI transforms
+
+# Visualization and logging
+matplotlib>=3.5.0
+tensorboard>=2.8.0
+tqdm>=4.62.0
+
+# Utilities
+pathlib2>=2.3.0  # For older Python versions
+psutil>=5.8.0  # For system monitoring
+
+# Optional: for distributed training
+# torch.distributed  # Usually included with torch
+
+# Development and testing
+pytest>=6.2.0
+pytest-cov>=3.0.0
