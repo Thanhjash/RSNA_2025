@@ -1,59 +1,41 @@
-# Data directories
-data/raw/
-data/processed/
+# Data files
+data/
+*.nii.gz
+*.h5
+*.hdf5
+
+# Checkpoints
 checkpoints/
-logs/
+*.pth
+*.pt
+
+# Logs
+*.log
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
-*.pyd
-.Python
-env/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.log
-.git
-.mypy_cache
-.pytest_cache
-.hypothesis
+.pytest_cache/
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Jupyter
+.ipynb_checkpoints/
 
-# pyenv
-.python-version
-
-# dotenv
-.env
-
-# virtualenv
-.venv/
-venv/
-ENV/
-env/
-VENV/
-
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
+# System
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
+
+# MinkowskiEngine source (too large)
+source/MinkowskiEngine/
+
+# Wheel (upload separately to Kaggle)
+wheels/
+
+# Test files
+test/
+test_*.py
+
+# Temporary
+*.tmp
+*.swp
+*~

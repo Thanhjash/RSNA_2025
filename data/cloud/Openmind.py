@@ -17,7 +17,8 @@ import warnings
 import gc
 import shutil
 
-from intensity_normalization import NyulNormalizer, create_image
+import pymedio.image as mioi
+from intensity_normalization.normalize.nyul import NyulNormalizer
 
 # Suppress warnings like RSNA pipeline
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -99,7 +100,7 @@ def learn_nyul_model(df_keep, logger):
                 not np.isnan(img_array).any() and 
                 not np.isinf(img_array).any()):
                 
-                img_obj = create_image(img_array)
+                img_obj = mioi.Image.from_array(img_array)
                 learning_images.append(img_obj)
                 
         except Exception:
@@ -215,7 +216,7 @@ def process_file_worker(args):
                     not np.isinf(img_array).any() and
                     img_array.max() > img_array.min()):
                     
-                    img_to_norm = create_image(img_array)
+                    img_to_norm = mioi.Image.from_array(img_array)
                     normalized_img_obj = NYUL_MODEL.transform(img_to_norm)
                     normalized_data = normalized_img_obj.get_data().astype(np.float32)
                     

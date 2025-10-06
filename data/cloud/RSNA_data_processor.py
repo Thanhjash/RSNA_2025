@@ -20,7 +20,8 @@ import pickle
 import logging
 import warnings
 
-from intensity_normalization import NyulNormalizer, create_image
+import pymedio.image as mioi
+from intensity_normalization.normalize.nyul import NyulNormalizer
 
 # Suppress annoying warnings
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -177,7 +178,7 @@ def learn_nyul_model(df_train, series_base_dir, output_dir, logger):
         
         if raw_path:
             try:
-                img_obj = create_image(str(raw_path))
+                img_obj = mioi.Image.from_path(str(raw_path))
                 data = img_obj.get_data()
                 if np.sum(data) > 0 and not np.isnan(data).any():
                     learning_images.append(img_obj)
@@ -306,7 +307,7 @@ def process_series_worker(args):
                 if np.isnan(img_array).any() or np.isinf(img_array).any():
                     raise ValueError("Invalid pixel values in MRI data")
                 
-                img_to_norm = create_image(img_array)
+                img_to_norm = mioi.Image.from_array(img_array)
                 normalized_img_obj = NYUL_MODEL.transform(img_to_norm)
                 normalized_data = normalized_img_obj.get_data().astype(np.float32)
                 

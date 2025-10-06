@@ -36,7 +36,7 @@ def dwt3d_forward(x: torch.Tensor, wavelet: str = 'db1', level: int = 1) -> Tupl
     x_reshaped = x_permuted.reshape(B, D, H, W * C)
 
     # Apply 3D DWT using ptwt
-    coeffs = ptwt.wavedec3(x_reshaped, wavelet=wavelet, level=level, mode='zero')
+    coeffs = ptwt.wavedec3(x_reshaped, wavelet=wavelet, level=level)
 
     # Unpack coefficients
     low_freq_packed = coeffs[0]  # [B, D//2, H//2, W//2*C]
@@ -87,7 +87,7 @@ def dwt3d_inverse(low_freq: torch.Tensor, high_freq_levels: List[Dict[str, torch
 
     # Reconstruct using ptwt
     coeffs = [low_freq_packed] + high_freq_levels_packed
-    reconstructed_packed = ptwt.waverec3(coeffs, wavelet=wavelet, mode='zero')
+    reconstructed_packed = ptwt.waverec3(coeffs, wavelet=wavelet)
 
     # Reshape back to [B, C, D, H, W]
     D, H, W = D_half * 2, H_half * 2, W_half * 2
@@ -197,7 +197,12 @@ class WaveFormer3D(nn.Module):
         # Patch embedding layer
         # Use stride=16 for 64^3 -> 4^3 patches, adjust based on input size
         patch_size = 16
-        self.patch_embed = nn.Conv3d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+        # UNIFIED MODEL: Dual patch embedding for multi-modal training
+        # Supports both 1-channel (MRI) and 3-channel (CT) inputs
+        self.patch_embed_1ch = nn.Conv3d(1, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.patch_embed_3ch = nn.Conv3d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.in_chans = in_chans  # Store for reference
 
         # Calculate number of patches
         self.num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size) * (img_size[2] // patch_size)
@@ -246,15 +251,23 @@ class WaveFormer3D(nn.Module):
         Forward pass returning features and optionally intermediate representations
 
         Args:
-            x: Input tensor [B, C, D, H, W]
+            x: Input tensor [B, C, D, H, W] where C can be 1 (MRI) or 3 (CT)
             return_intermediate: Whether to return intermediate features for contrastive learning
 
         Returns:
             If return_intermediate=False: Final features [B, embed_dim, D', H', W']
             If return_intermediate=True: (final_features, intermediate_features_list)
         """
-        # Patch embedding
-        x = self.patch_embed(x)  # [B, embed_dim, D/16, H/16, W/16]
+        # UNIFIED MODEL: Adaptive patch embedding based on input channels
+        num_channels = x.shape[1]
+        if num_channels == 1:
+            x = self.patch_embed_1ch(x)  # MRI: 1-channel input
+        elif num_channels == 3:
+            x = self.patch_embed_3ch(x)  # CT: 3-channel input
+        else:
+            raise ValueError(f"Unsupported channel count: {num_channels}. Expected 1 (MRI) or 3 (CT)")
+
+        # [B, embed_dim, D/16, H/16, W/16]
 
         # Add positional embedding
         x = x + self.pos_embed
@@ -282,44 +295,3 @@ class WaveFormer3D(nn.Module):
         """Calculate output feature map size given input size"""
         patch_size = 16
         return tuple(s // patch_size for s in input_size)
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Test WaveFormer components
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Test basic DWT operations
-    test_tensor = torch.randn(2, 64, 8, 8, 8).to(device)
-    low_freq, high_freq = dwt3d_forward(test_tensor)
-    reconstructed = dwt3d_inverse(low_freq, high_freq)
-    print(f"DWT reconstruction error: {torch.mean((test_tensor - reconstructed)**2).item():.6f}")
-
-    # Test WaveFormer block
-    block = WaveletAttentionEncoderBlock(dim=64).to(device)
-    output = block(test_tensor)
-    print(f"WaveFormer block output shape: {output.shape}")
-
-    # Test complete WaveFormer
-    model = WaveFormer3D(
-        img_size=(64, 64, 64),
-        in_chans=1,
-        embed_dim=768,
-        depth=6,  # Reduced for testing
-        num_heads=12
-    ).to(device)
-
-    test_input = torch.randn(2, 1, 64, 64, 64).to(device)
-    final_features, intermediate_features = model(test_input)
-
-    print(f"Input shape: {test_input.shape}")
-    print(f"Final features shape: {final_features.shape}")
-    print(f"Number of intermediate features: {len(intermediate_features)}")
-    for i, feat in enumerate(intermediate_features):
-        print(f"  Intermediate {i}: {feat.shape}")
-
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")

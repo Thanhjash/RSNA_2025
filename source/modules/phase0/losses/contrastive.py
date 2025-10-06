@@ -1,395 +1,337 @@
 """
-Cross-Level Alignment Loss with InfoNCE
+Cross-Level Contrastive Learning for WaveFormer
 Implementation for RSNA 2025 Phase 0 Pre-training
 
-This module implements contrastive learning for cross-scale semantic consistency:
-- InfoNCE contrastive loss between different scale features
-- Projection heads for contrastive learning
-- Support for both dense and sparse feature representations
-- Integration with WaveFormer and SparK intermediate features
+Implements:
+- InfoNCE loss for cross-level feature alignment
+- Multi-scale feature extraction and pooling
+- Temperature-scaled contrastive learning
+- Positive/negative pair construction across hierarchical levels
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import MinkowskiEngine as ME
-from typing import Tuple, List, Dict, Union, Optional
-import math
+from typing import List, Tuple, Dict
 
 
-class ProjectionHead(nn.Module):
+class InfoNCELoss(nn.Module):
     """
-    Projection head for contrastive learning
-
-    Projects high-dimensional features to a lower-dimensional space
-    optimized for contrastive learning with InfoNCE loss
+    InfoNCE (Noise Contrastive Estimation) loss for contrastive learning
+    
+    Formula:
+        L = -log[ exp(sim(z_i, z_j) / τ) / Σ_k exp(sim(z_i, z_k) / τ) ]
+    
+    where:
+        - z_i, z_j are positive pairs (same sample, different levels)
+        - z_k are negative pairs (different samples)
+        - τ is temperature parameter
+        - sim is cosine similarity
     """
-    def __init__(self,
-                 input_dim: int,
-                 projection_dim: int = 128,
-                 hidden_dim: Optional[int] = None,
-                 num_layers: int = 2):
-        super().__init__()
-        if hidden_dim is None:
-            hidden_dim = input_dim // 2
-
-        layers = []
-
-        # First layer
-        layers.extend([
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-        ])
-
-        # Additional hidden layers
-        for _ in range(num_layers - 2):
-            layers.extend([
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
-            ])
-
-        # Final projection layer
-        layers.extend([
-            nn.Linear(hidden_dim, projection_dim),
-            nn.LayerNorm(projection_dim)
-        ])
-
-        self.projection = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    
+    def __init__(self, temperature=0.07, normalize=True):
         """
         Args:
-            x: Input features [B, feature_dim] or [N, feature_dim]
-        Returns:
-            Projected features [B, projection_dim] or [N, projection_dim]
+            temperature: Temperature parameter for scaling similarities
+            normalize: Whether to L2-normalize features before computing similarity
         """
-        return self.projection(x)
-
-
-def info_nce_loss(query: torch.Tensor,
-                  positive_key: torch.Tensor,
-                  negative_keys: torch.Tensor,
-                  temperature: float = 0.07) -> torch.Tensor:
-    """
-    InfoNCE contrastive loss implementation
-
-    Args:
-        query: Query representations [B, D]
-        positive_key: Positive key representations [B, D]
-        negative_keys: Negative key representations [B, N, D] or [N, D]
-        temperature: Temperature parameter for softmax
-
-    Returns:
-        InfoNCE loss scalar
-    """
-    # L2 normalize all representations
-    query = F.normalize(query, p=2, dim=-1)
-    positive_key = F.normalize(positive_key, p=2, dim=-1)
-
-    if negative_keys.dim() == 3:  # [B, N, D]
-        negative_keys = F.normalize(negative_keys, p=2, dim=-1)
-    else:  # [N, D]
-        negative_keys = F.normalize(negative_keys, p=2, dim=-1)
-
-    # Compute positive similarities
-    l_pos = torch.sum(query * positive_key, dim=-1, keepdim=True)  # [B, 1]
-
-    # Compute negative similarities
-    if negative_keys.dim() == 3:  # [B, N, D]
-        l_neg = torch.bmm(query.unsqueeze(1), negative_keys.transpose(1, 2)).squeeze(1)  # [B, N]
-    else:  # [N, D] - broadcast across batch
-        l_neg = torch.mm(query, negative_keys.T)  # [B, N]
-
-    # Combine positive and negative similarities
-    logits = torch.cat([l_pos, l_neg], dim=1) / temperature  # [B, 1+N]
-
-    # Labels: positive is always the first (index 0)
-    labels = torch.zeros(logits.shape[0], dtype=torch.long, device=query.device)
-
-    # Cross-entropy loss
-    return F.cross_entropy(logits, labels)
-
-
-def extract_sparse_features(sparse_tensor: ME.SparseTensor, batch_size: int) -> torch.Tensor:
-    """
-    Extract and pool features from sparse tensor for contrastive learning
-
-    Args:
-        sparse_tensor: MinkowskiEngine SparseTensor
-        batch_size: Number of items in batch
-
-    Returns:
-        Pooled features [B, feature_dim]
-    """
-    device = sparse_tensor.device
-    feature_dim = sparse_tensor.F.shape[1]
-
-    # Pool features by batch
-    pooled_features = []
-    for b in range(batch_size):
-        batch_mask = sparse_tensor.C[:, 0] == b
-        if batch_mask.sum() > 0:
-            # Use mean pooling across spatial locations
-            batch_features = sparse_tensor.F[batch_mask].mean(0)
-        else:
-            # Handle empty case
-            batch_features = torch.zeros(feature_dim, device=device)
-        pooled_features.append(batch_features)
-
-    return torch.stack(pooled_features, dim=0)
-
-
-def extract_dense_features(dense_tensor: torch.Tensor) -> torch.Tensor:
-    """
-    Extract and pool features from dense tensor for contrastive learning
-
-    Args:
-        dense_tensor: Dense feature tensor [B, C, D, H, W]
-
-    Returns:
-        Pooled features [B, C]
-    """
-    # Global average pooling across spatial dimensions
-    return dense_tensor.flatten(2).mean(dim=2)  # [B, C]
-
-
-class CrossLevelAlignmentLoss(nn.Module):
-    """
-    InfoNCE contrastive loss for cross-scale semantic consistency
-
-    This loss encourages features from different scales/levels to maintain
-    semantic consistency, helping the model learn hierarchical representations
-    """
-    def __init__(self,
-                 feature_dim: int = 768,
-                 projection_dim: int = 128,
-                 temperature: float = 0.07,
-                 num_negatives: int = 256):
         super().__init__()
-        self.feature_dim = feature_dim
-        self.projection_dim = projection_dim
         self.temperature = temperature
-        self.num_negatives = num_negatives
-
-        # Projection heads for different feature types
-        self.level1_projector = ProjectionHead(feature_dim, projection_dim)
-        self.level2_projector = ProjectionHead(feature_dim, projection_dim)
-
-    def forward(self,
-                features_level1: Union[torch.Tensor, ME.SparseTensor],
-                features_level2: Union[torch.Tensor, ME.SparseTensor],
-                batch_size: Optional[int] = None) -> torch.Tensor:
+        self.normalize = normalize
+    
+    def forward(self, features_1: torch.Tensor, features_2: torch.Tensor) -> torch.Tensor:
         """
-        Compute cross-level alignment loss between two feature representations
-
+        Compute InfoNCE loss between two feature sets
+        
         Args:
-            features_level1: Features from first level/scale
-            features_level2: Features from second level/scale
-            batch_size: Batch size (required for sparse tensors)
-
+            features_1: Features from level 1 [B, D]
+            features_2: Features from level 2 [B, D]
+        
         Returns:
-            Contrastive alignment loss
+            InfoNCE loss scalar
         """
-        device = features_level1.device if hasattr(features_level1, 'device') else features_level1.F.device
-
-        # Extract features based on type
-        if isinstance(features_level1, ME.SparseTensor):
-            if batch_size is None:
-                batch_size = features_level1.C[:, 0].max().item() + 1
-            feat1_pooled = extract_sparse_features(features_level1, batch_size)
-        else:
-            feat1_pooled = extract_dense_features(features_level1)
-            batch_size = feat1_pooled.shape[0]
-
-        if isinstance(features_level2, ME.SparseTensor):
-            feat2_pooled = extract_sparse_features(features_level2, batch_size)
-        else:
-            feat2_pooled = extract_dense_features(features_level2)
-
-        # Project to contrastive space
-        level1_proj = self.level1_projector(feat1_pooled)  # [B, projection_dim]
-        level2_proj = self.level2_projector(feat2_pooled)  # [B, projection_dim]
-
-        # Prepare for InfoNCE
-        query = level1_proj
-        positive_key = level2_proj
-
-        # Use all other samples in the batch as negatives
-        # Create negative keys by shifting positive keys
-        if batch_size > 1:
-            # Create negatives by using all other samples in batch
-            negative_indices = []
-            for i in range(batch_size):
-                # All other samples except current one
-                neg_idx = list(range(batch_size))
-                neg_idx.remove(i)
-                negative_indices.append(neg_idx)
-
-            # Stack negatives for each query
-            negative_keys = []
-            for i in range(batch_size):
-                if len(negative_indices[i]) > 0:
-                    neg_keys = level2_proj[negative_indices[i]]  # [batch_size-1, projection_dim]
-
-                    # Sample random negatives if we have too many
-                    if len(neg_keys) > self.num_negatives:
-                        rand_idx = torch.randperm(len(neg_keys))[:self.num_negatives]
-                        neg_keys = neg_keys[rand_idx]
-
-                    negative_keys.append(neg_keys)
-                else:
-                    # Handle single batch case
-                    negative_keys.append(torch.zeros(1, self.projection_dim, device=device))
-
-            # Pad to same length and stack
-            max_negatives = max(len(nk) for nk in negative_keys)
-            padded_negatives = []
-            for neg_keys in negative_keys:
-                if len(neg_keys) < max_negatives:
-                    # Pad with zeros
-                    padding = torch.zeros(max_negatives - len(neg_keys), self.projection_dim, device=device)
-                    neg_keys = torch.cat([neg_keys, padding], dim=0)
-                padded_negatives.append(neg_keys)
-
-            negative_keys_tensor = torch.stack(padded_negatives, dim=0)  # [B, max_negatives, projection_dim]
-        else:
-            # Single batch case - create dummy negatives
-            negative_keys_tensor = torch.zeros(1, 1, self.projection_dim, device=device)
-
-        # Compute InfoNCE loss
-        contrastive_loss = info_nce_loss(query, positive_key, negative_keys_tensor, self.temperature)
-
-        return contrastive_loss
+        batch_size = features_1.shape[0]
+        
+        # Normalize features
+        if self.normalize:
+            features_1 = F.normalize(features_1, dim=1)
+            features_2 = F.normalize(features_2, dim=1)
+        
+        # Compute similarity matrix [B, B]
+        # similarity[i, j] = cosine_similarity(features_1[i], features_2[j])
+        similarity_matrix = torch.matmul(features_1, features_2.T) / self.temperature
+        
+        # Positive pairs are on the diagonal
+        positive_samples = torch.diag(similarity_matrix)  # [B]
+        
+        # Compute denominator: sum over all samples (including positive)
+        # For sample i: Σ_j exp(sim(z_i, z_j) / τ)
+        exp_similarities = torch.exp(similarity_matrix)  # [B, B]
+        denominator = exp_similarities.sum(dim=1)  # [B]
+        
+        # InfoNCE loss: -log(exp(positive) / denominator)
+        loss = -torch.log(torch.exp(positive_samples) / denominator)
+        
+        return loss.mean()
 
 
-class MultiLevelContrastiveLoss(nn.Module):
+class CrossLevelContrastiveLoss(nn.Module):
     """
-    Multi-level contrastive loss for hierarchical feature learning
+    FIXED: Spatially-aware contrastive learning across WaveFormer hierarchical levels
 
-    Computes contrastive losses between multiple pairs of feature levels
-    to encourage consistent hierarchical representations
+    Strategy:
+    - Sample unmasked spatial locations from features
+    - Enforce consistency at SAME coordinates across encoder depths
+    - Use InfoNCE with spatial sampling (not global pooling)
+    - Positive pairs: same (d,h,w) location across levels
+    - Negative pairs: different locations
     """
-    def __init__(self,
-                 feature_dims: List[int],
-                 projection_dim: int = 128,
-                 temperature: float = 0.07,
-                 level_weights: Optional[List[float]] = None):
+
+    def __init__(self, feature_dims: List[int], projection_dim=128,
+                 temperature=0.1, num_samples=256):
+        """
+        Args:
+            feature_dims: List of feature dimensions from each level (should be same for simplicity)
+            projection_dim: Dimension of spatial projection
+            temperature: Temperature for InfoNCE loss
+            num_samples: Number of spatial locations to sample per batch
+        """
         super().__init__()
-        self.feature_dims = feature_dims
         self.projection_dim = projection_dim
         self.temperature = temperature
+        self.num_samples = num_samples
         self.num_levels = len(feature_dims)
 
-        # Default equal weights for all level pairs
-        if level_weights is None:
-            level_weights = [1.0] * (self.num_levels - 1)
-        self.level_weights = level_weights
+        # FIXED: Spatial-preserving 1x1x1 convolution projector (not Linear)
+        # Use same projector for all levels (assume same feature_dim)
+        self.projector = nn.Conv3d(feature_dims[0], projection_dim, kernel_size=1, bias=False)
 
-        # Create alignment losses for adjacent levels
-        self.alignment_losses = nn.ModuleList()
-        for i in range(self.num_levels - 1):
-            loss_module = CrossLevelAlignmentLoss(
-                feature_dim=feature_dims[i],  # Use first level's dimension
-                projection_dim=projection_dim,
-                temperature=temperature
-            )
-            # Update second projector for different dimension if needed
-            if feature_dims[i] != feature_dims[i + 1]:
-                loss_module.level2_projector = ProjectionHead(feature_dims[i + 1], projection_dim)
-
-            self.alignment_losses.append(loss_module)
-
-    def forward(self,
-                feature_list: List[Union[torch.Tensor, ME.SparseTensor]],
-                batch_size: Optional[int] = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(self, intermediate_features: List[torch.Tensor],
+                unmasked_mask: torch.Tensor = None) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute multi-level contrastive loss
+        FIXED: Compute spatially-aware cross-level contrastive loss
 
         Args:
-            feature_list: List of features from different levels
-            batch_size: Batch size for sparse tensors
+            intermediate_features: List of feature tensors from different levels
+                Each tensor shape: [B, C, D, H, W]
+            unmasked_mask: Optional boolean mask [B, 1, D, H, W] for sampling locations
+                If None, sample from all locations
 
         Returns:
-            Total loss and dictionary of individual level losses
+            Tuple of (total_loss, loss_dict)
         """
-        if len(feature_list) != self.num_levels:
-            raise ValueError(f"Expected {self.num_levels} feature levels, got {len(feature_list)}")
+        if len(intermediate_features) < 2:
+            return torch.tensor(0.0, device=intermediate_features[0].device), {}
 
-        total_loss = 0.0
-        loss_dict = {}
+        # Use first and last intermediate features (coarse and fine)
+        features_coarse = intermediate_features[0]
+        features_fine = intermediate_features[-1]
 
-        # Compute contrastive loss between adjacent levels
-        for i in range(self.num_levels - 1):
-            level_loss = self.alignment_losses[i](
-                feature_list[i],
-                feature_list[i + 1],
-                batch_size
+        B, C, D, H, W = features_coarse.shape
+
+        # FIXED: Align fine features to coarse resolution via interpolation
+        if features_fine.shape[2:] != features_coarse.shape[2:]:
+            features_fine_aligned = F.interpolate(
+                features_fine, size=(D, H, W), mode='trilinear', align_corners=False
             )
+        else:
+            features_fine_aligned = features_fine
 
-            weighted_loss = self.level_weights[i] * level_loss
-            total_loss += weighted_loss
+        # FIXED: Project features while preserving spatial structure
+        proj_coarse = F.normalize(self.projector(features_coarse), p=2, dim=1)  # [B, proj_dim, D, H, W]
+        proj_fine = F.normalize(self.projector(features_fine_aligned), p=2, dim=1)
 
-            loss_dict[f'level_{i}_to_{i+1}_loss'] = level_loss
-            loss_dict[f'level_{i}_to_{i+1}_weighted'] = weighted_loss
+        # Sample spatial locations
+        if unmasked_mask is not None:
+            # Resize mask to match feature resolution if needed
+            if unmasked_mask.shape[2:] != (D, H, W):
+                unmasked_mask_resized = F.interpolate(
+                    unmasked_mask.float(), size=(D, H, W), mode='nearest'
+                ).bool()
+            else:
+                unmasked_mask_resized = unmasked_mask
 
-        loss_dict['total_contrastive_loss'] = total_loss
+            # Get unmasked indices [Total_Unmasked, 4] where 4 = (b, 1, d, h, w)
+            unmasked_indices = torch.nonzero(unmasked_mask_resized, as_tuple=False)
+
+            if len(unmasked_indices) == 0:
+                return torch.tensor(0.0, device=features_coarse.device), {}
+
+            # Sample subset if too many
+            if len(unmasked_indices) > self.num_samples:
+                sample_idx = torch.randperm(len(unmasked_indices), device=features_coarse.device)[:self.num_samples]
+                unmasked_indices = unmasked_indices[sample_idx]
+
+            b_idx, _, d_idx, h_idx, w_idx = unmasked_indices.unbind(dim=1)
+        else:
+            # Sample random locations
+            num_samples = min(self.num_samples, B * D * H * W)
+            sample_coords = torch.randint(0, B * D * H * W, (num_samples,), device=features_coarse.device)
+            b_idx = sample_coords // (D * H * W)
+            spatial_idx = sample_coords % (D * H * W)
+            d_idx = spatial_idx // (H * W)
+            h_idx = (spatial_idx % (H * W)) // W
+            w_idx = spatial_idx % W
+
+        # FIXED: Gather features at SAME spatial locations from both levels
+        queries = proj_coarse[b_idx, :, d_idx, h_idx, w_idx]  # [N, proj_dim]
+        keys = proj_fine[b_idx, :, d_idx, h_idx, w_idx]       # [N, proj_dim]
+
+        if len(queries) < 2:
+            return torch.tensor(0.0, device=features_coarse.device), {}
+
+        # FIXED: InfoNCE loss - positive pairs are diagonal (same location)
+        logits = torch.matmul(queries, keys.T) / self.temperature  # [N, N]
+        labels = torch.arange(len(queries), device=features_coarse.device)
+
+        loss = F.cross_entropy(logits, labels)
+
+        loss_dict = {
+            'contrastive_spatial': loss.item(),
+            'num_sampled_locations': len(queries)
+        }
+
+        return loss, loss_dict
+
+
+class SymmetricContrastiveLoss(nn.Module):
+    """
+    Symmetric cross-level contrastive loss (bidirectional)
+    
+    Computes InfoNCE in both directions:
+    - Level i -> Level j
+    - Level j -> Level i
+    
+    Helps with feature alignment when levels have different capacities
+    """
+    
+    def __init__(self, feature_dims: List[int], projection_dim=256, temperature=0.07):
+        super().__init__()
+        self.cross_level_loss = CrossLevelContrastiveLoss(
+            feature_dims=feature_dims,
+            projection_dim=projection_dim,
+            temperature=temperature
+        )
+    
+    def forward(self, intermediate_features: List[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute symmetric contrastive loss
+        
+        Args:
+            intermediate_features: List of feature tensors [B, C, D, H, W]
+        
+        Returns:
+            Tuple of (total_loss, loss_dict)
+        """
+        # Forward direction
+        loss_forward, dict_forward = self.cross_level_loss(intermediate_features)
+        
+        # Backward direction (reverse feature list)
+        loss_backward, dict_backward = self.cross_level_loss(intermediate_features[::-1])
+        
+        # Combine losses
+        total_loss = (loss_forward + loss_backward) / 2.0
+        
+        # Merge dictionaries
+        loss_dict = {**dict_forward}
+        for k, v in dict_backward.items():
+            loss_dict[f'{k}_reverse'] = v
+        loss_dict['symmetric_total'] = total_loss.item()
+        
         return total_loss, loss_dict
 
 
-# Example usage and testing
-if __name__ == "__main__":
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+class MomentumContrastiveLoss(nn.Module):
+    """
+    Momentum-based contrastive learning with memory bank
+    
+    Maintains a queue of negative samples from previous batches
+    to increase the number of negative pairs without larger batch sizes
+    
+    Based on MoCo (Momentum Contrast) approach
+    """
+    
+    def __init__(self, feature_dim=256, queue_size=4096, momentum=0.999, temperature=0.07):
+        """
+        Args:
+            feature_dim: Dimension of feature vectors
+            queue_size: Size of negative sample queue
+            momentum: Momentum for updating key encoder (0.999 typical)
+            temperature: Temperature for InfoNCE loss
+        """
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.queue_size = queue_size
+        self.momentum = momentum
+        self.temperature = temperature
+        
+        # Initialize queue with random features
+        self.register_buffer('queue', torch.randn(feature_dim, queue_size))
+        self.queue = F.normalize(self.queue, dim=0)
+        
+        # Queue pointer
+        self.register_buffer('queue_ptr', torch.zeros(1, dtype=torch.long))
+    
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, keys: torch.Tensor):
+        """
+        Update queue with new keys
+        
+        Args:
+            keys: New key features [B, feature_dim]
+        """
+        batch_size = keys.shape[0]
+        
+        ptr = int(self.queue_ptr)
+        
+        # Replace oldest features in queue
+        if ptr + batch_size <= self.queue_size:
+            self.queue[:, ptr:ptr + batch_size] = keys.T
+        else:
+            # Wrap around
+            remaining = self.queue_size - ptr
+            self.queue[:, ptr:] = keys[:remaining].T
+            self.queue[:, :batch_size - remaining] = keys[remaining:].T
+        
+        # Update pointer
+        ptr = (ptr + batch_size) % self.queue_size
+        self.queue_ptr[0] = ptr
+    
+    def forward(self, queries: torch.Tensor, keys: torch.Tensor) -> torch.Tensor:
+        """
+        Compute momentum contrastive loss
+        
+        Args:
+            queries: Query features [B, feature_dim]
+            keys: Key features [B, feature_dim] (from momentum encoder)
+        
+        Returns:
+            MoCo loss scalar
+        """
+        # Normalize
+        queries = F.normalize(queries, dim=1)
+        keys = F.normalize(keys, dim=1)
+        
+        # Positive logits: [B, 1]
+        positive_logits = torch.einsum('nc,nc->n', [queries, keys]).unsqueeze(-1)
+        
+        # Negative logits: [B, queue_size]
+        negative_logits = torch.einsum('nc,ck->nk', [queries, self.queue.clone().detach()])
+        
+        # Concatenate: [B, 1 + queue_size]
+        logits = torch.cat([positive_logits, negative_logits], dim=1)
+        
+        # Apply temperature
+        logits /= self.temperature
+        
+        # Labels: positive is always first (index 0)
+        labels = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
+        
+        # Cross-entropy loss
+        loss = F.cross_entropy(logits, labels)
+        
+        # Update queue
+        self._dequeue_and_enqueue(keys)
+        
+        return loss
 
-    # Test projection head
-    proj_head = ProjectionHead(input_dim=768, projection_dim=128).to(device)
-    test_features = torch.randn(4, 768).to(device)
-    projected = proj_head(test_features)
-    print(f"Projection: {test_features.shape} -> {projected.shape}")
-
-    # Test InfoNCE loss
-    batch_size = 4
-    projection_dim = 128
-
-    query = torch.randn(batch_size, projection_dim).to(device)
-    positive = torch.randn(batch_size, projection_dim).to(device)
-    negatives = torch.randn(batch_size, 10, projection_dim).to(device)
-
-    loss = info_nce_loss(query, positive, negatives)
-    print(f"InfoNCE loss: {loss.item():.6f}")
-
-    # Test cross-level alignment loss
-    alignment_loss = CrossLevelAlignmentLoss(feature_dim=256, projection_dim=128).to(device)
-
-    # Test with dense features
-    dense_feat1 = torch.randn(2, 256, 8, 8, 8).to(device)
-    dense_feat2 = torch.randn(2, 256, 4, 4, 4).to(device)
-
-    dense_loss = alignment_loss(dense_feat1, dense_feat2)
-    print(f"Dense cross-level loss: {dense_loss.item():.6f}")
-
-    # Test multi-level contrastive loss
-    feature_dims = [128, 256, 512]
-    multi_loss = MultiLevelContrastiveLoss(
-        feature_dims=feature_dims,
-        projection_dim=128,
-        level_weights=[1.0, 0.5]
-    ).to(device)
-
-    # Create test features of different dimensions
-    test_features = [
-        torch.randn(2, 128, 16, 16, 16).to(device),
-        torch.randn(2, 256, 8, 8, 8).to(device),
-        torch.randn(2, 512, 4, 4, 4).to(device)
-    ]
-
-    total_loss, loss_breakdown = multi_loss(test_features)
-    print(f"Multi-level contrastive loss: {total_loss.item():.6f}")
-    for key, value in loss_breakdown.items():
-        print(f"  {key}: {value.item():.6f}")
-
-    # Count parameters
-    total_params = sum(p.numel() for p in alignment_loss.parameters())
-    print(f"Cross-level alignment loss parameters: {total_params:,}")
-
-    multi_params = sum(p.numel() for p in multi_loss.parameters())
-    print(f"Multi-level contrastive loss parameters: {multi_params:,}")
