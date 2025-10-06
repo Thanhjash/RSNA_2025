@@ -1,0 +1,10 @@
+{
+    "remote.autoForwardPorts": false,
+    "remote.autoForwardPortsSource": "hybrid",
+    "remote.ports.attributes": {},
+    "python.defaultInterpreterPath": "/home/thanhjash/miniconda3/envs/kaggle/bin/python",
+    "python.terminal.activateEnvironment": true,
+    "jupyter.kernels.excludePythonEnvironments": [
+        "/home/thanhjash/miniconda3/envs/kaggle/bin/python"
+    ]
+}

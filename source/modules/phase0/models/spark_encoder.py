@@ -147,34 +147,52 @@ class SparKDecoder(nn.Module):
         self.num_stages = num_stages
         self.use_skip_connections = use_skip_connections
         
+        # Calculate encoder stage channels for skip connections
+        encoder_stage_channels = []
+        enc_channels = base_channels
+        for i in range(num_stages):
+            enc_channels = enc_channels * 2
+            encoder_stage_channels.append(enc_channels)
+        # encoder_stage_channels = [192, 384, 768, 1536] for base=96
+
         # Build decoder stages (reverse of encoder)
         self.stages = nn.ModuleList()
         current_channels = encoder_channels
-        
+
         for stage_idx in range(num_stages):
-            # Calculate skip connection channels if enabled
-            skip_channels = current_channels if use_skip_connections else 0
-            
+            # Channels after upsampling
+            upsampled_channels = current_channels // 2
+
+            # Calculate skip connection channels
+            skip_idx = num_stages - stage_idx - 3  # Maps to encoder stage
+            if use_skip_connections and skip_idx >= 0 and skip_idx < len(encoder_stage_channels):
+                skip_channels = encoder_stage_channels[skip_idx]
+            else:
+                skip_channels = 0
+
+            # After skip concatenation
+            conv_in_channels = upsampled_channels + skip_channels
+
             stage = nn.ModuleDict({
                 'upsample': ME.MinkowskiConvolutionTranspose(
-                    in_channels=current_channels + skip_channels,
-                    out_channels=current_channels // 2,
+                    in_channels=current_channels,  # Only current (skip comes AFTER upsample)
+                    out_channels=upsampled_channels,
                     kernel_size=2,
                     stride=2 if stage_idx < num_stages - 1 else 1,
                     dimension=3
                 ),
-                'bn1': ME.MinkowskiBatchNorm(current_channels // 2),
+                'bn1': ME.MinkowskiBatchNorm(upsampled_channels),
                 'conv': ME.MinkowskiConvolution(
-                    in_channels=current_channels // 2,
-                    out_channels=current_channels // 2,
+                    in_channels=conv_in_channels,  # Includes skip channels after concat
+                    out_channels=upsampled_channels,
                     kernel_size=3,
                     stride=1,
                     dimension=3
                 ),
-                'bn2': ME.MinkowskiBatchNorm(current_channels // 2)
+                'bn2': ME.MinkowskiBatchNorm(upsampled_channels)
             })
             self.stages.append(stage)
-            current_channels = current_channels // 2
+            current_channels = upsampled_channels
         
         # Final projection to WaveFormer feature dimension (768)
         self.output_proj = ME.MinkowskiLinear(current_channels, 768)
@@ -197,19 +215,22 @@ class SparKDecoder(nn.Module):
         
         # Apply decoder stages
         for stage_idx, stage in enumerate(self.stages):
-            # Add skip connection if enabled
-            if self.use_skip_connections and encoder_features is not None:
-                skip_idx = len(encoder_features) - 1 - stage_idx
-                if skip_idx >= 0:
-                    skip_features = encoder_features[skip_idx]
-                    # Concatenate along feature dimension
-                    x = ME.cat(x, skip_features)
-            
-            # Upsample and process
+            # Upsample first to match resolution
             x = stage['upsample'](x)
             x = stage['bn1'](x)
             x = ME.MinkowskiReLU()(x)
-            
+
+            # Add skip connection AFTER upsampling (same resolution now)
+            # Map decoder stages to encoder stages with matching resolutions
+            # Decoder Stage 0 (upsampled) → Encoder Stage 1
+            # Decoder Stage 1 (upsampled) → Encoder Stage 0
+            if self.use_skip_connections and encoder_features is not None:
+                skip_idx = self.num_stages - stage_idx - 3  # Maps upsampled decoder to matching encoder
+                if skip_idx >= 0 and skip_idx < len(encoder_features):
+                    skip_features = encoder_features[skip_idx]
+                    # Concatenate along feature dimension
+                    x = ME.cat(x, skip_features)
+
             x = stage['conv'](x)
             x = stage['bn2'](x)
             x = ME.MinkowskiReLU()(x)
